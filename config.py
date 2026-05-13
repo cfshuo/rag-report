@@ -50,36 +50,35 @@ API_BASE_URL = "http://localhost:1234/v1"
 API_KEY = "local-llm"
 
 # 视觉大模型 (用于 document_cleaner 的表格/公式识别)
-VLM_MODEL_NAME = "opengvlab_internvl3_5-8b"
+VLM_MODEL_NAME = "opengvlab_internvl3_5-30b-a3b"
 
 # 向量嵌入模型 (用于 vector_database_builder 和 chat_rag)
 EMBEDDING_MODEL_NAME = "text-embedding-bge-m3"
 
 # 逻辑推理大模型 (用于 information_extract 和 chat_rag)
-# 备选: "qwen/qwen3.5-35b-a3b" (35B MoE, 22GB, 质量高但慢)
 LLM_MODEL_NAME = "qwen/qwen3.5-9b"
 
 # GPU 显存分配比例
 GPU_OFFLOAD: Dict[str, str] = {
-    "vlm":       "max",   # InternVL 视觉模型
-    "embedding": "max",   # bge-m3 向量模型 (634MB, 全上 GPU)
-    "llm":       "max",   # Qwen 9B 推理模型 (6.5GB, 轻松全上 GPU)
+    "vlm":       "max",   # InternVL 30B 离线清洗，独占显存
+    "embedding": "max",   # bge-m3 向量模型 (634MB)
+    "llm":       "max",   # Qwen 9B 推理模型，轻松全上 GPU
 }
 
-# 推理上下文长度
-LLM_CONTEXT_LENGTH = 32768
+# 推理上下文长度 (Qwen3.5-9B 支持 32K，设 16384 给充足余量避免上下文溢出导致空响应)
+LLM_CONTEXT_LENGTH = 16384
 EMBEDDING_CONTEXT_LENGTH = 4096
 
 # VLM 调用配置
 USE_VLM = True
-VLM_TIMEOUT = 120
+VLM_TIMEOUT = 240  # 核心修改：30B 处理表格极慢，必须给足时间防止中断
 VLM_MAX_RETRIES = 2
 
 # ==========================================
-# 3. 文档切块配置
+# 3. 文档切块配置 (为 9B 模型专门扩容)
 # ==========================================
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 50
+CHUNK_SIZE = 800       # 增大尺寸，保证规范段落完整
+CHUNK_OVERLAP = 150    # 增大重叠，防止关键数据被腰斩
 
 # Markdown 标题切分层级
 HEADERS_TO_SPLIT_ON = [
@@ -92,7 +91,7 @@ HEADERS_TO_SPLIT_ON = [
 # ==========================================
 # 4. RAG 检索配置
 # ==========================================
-RETRIEVAL_K = 3
+RETRIEVAL_K = 5        # 增加召回数量，给 9B 提供更足的弹药
 
 # ==========================================
 # 5. 元数据提取配置
@@ -113,8 +112,8 @@ METADATA_FIELDS_STANDARD = {
     "发布年份": "2024",
 }
 
-# 用于元数据提取的最大字符数 (None = 读取全文)
-MAX_TEXT_FOR_METADATA: int | None = None
+# 核心修改：最多只读前 4000 字提取标签，防止整本书塞爆显存
+MAX_TEXT_FOR_METADATA = 4000
 
 # ==========================================
 # 6. Office 文件转换配置
@@ -122,15 +121,21 @@ MAX_TEXT_FOR_METADATA: int | None = None
 OFFICE_SUFFIXES = {".doc", ".docx", ".ppt", ".pptx"}
 
 # ==========================================
-# 7. VLM 提示词与标签配置
+# 7. VLM 提示词与标签配置 (30B 满血表格提取版)
 # ==========================================
 VLM_SYSTEM_PROMPT = (
-    "你是一个严谨的工程文档数据提取专家。请将图片中的表格精准转换为 Markdown 表格，"
-    "或将图片中的数学公式转换为 LaTeX 格式（行内使用 $...$，独立公式使用 $$...$$）。"
-    "只输出 Markdown 或 LaTeX 代码，不要解释。"
-    "在解析表格并转换为 Markdown 格式时，由于 Markdown 原生不支持单元格的跨行(rowspan)或跨列(colspan)合并，你必须遵守以下铁律：对于表格中的合并单元格，请务必将其文本内容【完整复制并拆分填充】到每一个对应的 Markdown 独立单元格中！严禁在合并对应的下方或右侧单元格中留空。确保每一行的数据独立且完整！"
+    "你是一位资深的海洋工程图像与数据解析专家。请精准解析输入图片中的核心信息：\n"
+    "1. 如果是数学公式：请转换为标准的 LaTeX 格式（行内使用 $...$，独立公式使用 $$...$$）。\n"
+    "2. 如果是工程图表（风玫瑰图、曲线图、流程图等）：请用严谨的工程师语言详细描述数据趋势或转换为 Markdown 列表。\n"
+    "3. 如果是数据表格：请将其精准转换为 Markdown 表格。\n"
+    "【⚠️ 表格提取绝对铁律 - 关乎系统生死】：\n"
+    "由于 Markdown 语法根本不支持跨行(rowspan)或跨列(colspan)的单元格合并，你必须在脑海中将表格完全拆解为规则的网格！\n"
+    "1. 只要遇到合并单元格，你必须将该单元格的文本内容【完整地重复打字】填充到对应的每一个 Markdown 独立单元格中！\n"
+    "2. 绝对不允许出现空的单元格（除非原图就是空的）。\n"
+    "3. 绝对不允许把上一行的合并项在下一行留空！\n"
+    "只输出最终的 Markdown 或 LaTeX 内容，绝对不要输出任何多余的解释、寒暄或代码块标记（如 ```markdown）。"
 )
-VLM_USER_TEXT = "请提取这张图片中的核心信息并转化为代码格式："
+VLM_USER_TEXT = "请精准提取这张图片中的核心工程信息并转化为代码或结构化文本："
 IMAGE_PLACEHOLDER = ""
 
 # ==========================================
@@ -140,13 +145,9 @@ def validate_config() -> Dict[str, List[str]]:
     """
     校验配置完整性，返回 {级别: [消息列表]}。
     无问题时返回空字典。
-
-    Returns:
-        dict: 例如 {"warning": ["...", "..."], "error": ["..."]}
     """
     issues: Dict[str, List[str]] = {"error": [], "warning": []}
 
-    # 必要目录
     for name, path in [
         ("ORIGIN_REPORT_DIR", ORIGIN_REPORT_DIR),
         ("ORIGIN_STANDARD_DIR", ORIGIN_STANDARD_DIR),
@@ -154,7 +155,6 @@ def validate_config() -> Dict[str, List[str]]:
         if not path.exists():
             issues["warning"].append(f"{name} 不存在: {path}")
 
-    # 输出目录可创建
     for name, path in [
         ("CLEAN_REPORT_DIR", CLEAN_REPORT_DIR),
         ("CLEAN_STANDARD_DIR", CLEAN_STANDARD_DIR),
@@ -164,16 +164,13 @@ def validate_config() -> Dict[str, List[str]]:
         except OSError as e:
             issues["error"].append(f"无法创建 {name}: {path} — {e}")
 
-    # 模型名称
     for name in ["LLM_MODEL_NAME", "EMBEDDING_MODEL_NAME", "VLM_MODEL_NAME"]:
         if not globals().get(name):
             issues["error"].append(f"{name} 未配置")
 
-    # API 地址
     if not API_BASE_URL:
         issues["error"].append("API_BASE_URL 未配置")
 
-    # 切块参数
     if CHUNK_SIZE <= CHUNK_OVERLAP:
         issues["error"].append(
             f"CHUNK_SIZE ({CHUNK_SIZE}) 必须大于 CHUNK_OVERLAP ({CHUNK_OVERLAP})"

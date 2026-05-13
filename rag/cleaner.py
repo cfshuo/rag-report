@@ -1,16 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-cleaner.py — Docling + Local VLM (InternVL) 自动化联合解析
+cleaner.py — Docling + Local VLM (InternVL 30B) 自动化联合解析
 
 集成 LM Studio 自动模型调度与 API 服务，遵循先转 PDF 再清洗原则。
-将原始报告/标准文档转换为结构化 Markdown，表格和公式由视觉大模型辅助识别。
-
-两种模式:
-  - USE_VLM=True:  Docling + 视觉大模型联合解析 (精度高，速度慢)
-  - USE_VLM=False: 纯 Docling 极速提取 (速度快，表格/公式可能丢失)
-
-Usage:
-    python document_cleaner.py
+针对复杂海洋工程文档：图表、公式、表格优先交由 30B 视觉大模型解析。
+独家优化：将 Docling 底层表格寻边模型强制转移至 CPU 运行，彻底解决单卡 OOM 问题！
 """
 
 import base64
@@ -24,7 +18,8 @@ from pathlib import Path
 
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions
+# 🛑 核心引入：引入 CPU 加速器控制模块
+from docling.datamodel.pipeline_options import PdfPipelineOptions, AcceleratorOptions, AcceleratorDevice
 from docling_core.types.doc import DocItemLabel
 from docling_core.types.doc.document import (
     FormulaItem,
@@ -49,7 +44,7 @@ _INPUT_DIRS = {
     config.ORIGIN_STANDARD_DIR: config.CLEAN_STANDARD_DIR,
 }
 
-# DocItemLabel 分类
+# 🛑 核心配置：表格重新纳入 VLM 处理范围，享受 30B 大模型的强力解析
 _VLM_LABELS = {
     DocItemLabel.TABLE,
     DocItemLabel.PICTURE,
@@ -83,15 +78,7 @@ class VLMCaller:
         return base64.b64encode(buf.getvalue()).decode("utf-8")
 
     def query(self, pil_image: Image.Image) -> str:
-        """
-        调用 VLM 识别图片内容。
-
-        Args:
-            pil_image: PIL 图片对象
-
-        Returns:
-            VLM 返回的 Markdown/LaTeX 文本，失败时返回空字符串
-        """
+        """调用 VLM 识别图片内容。"""
         img_b64 = self._encode_image(pil_image)
         for attempt in range(1 + config.VLM_MAX_RETRIES):
             try:
@@ -112,6 +99,7 @@ class VLMCaller:
                             ],
                         },
                     ],
+                    temperature=0.1,  # 极低温度，保证工程数据提取的严谨性
                     timeout=config.VLM_TIMEOUT,
                     max_tokens=4096,
                 )
@@ -129,12 +117,7 @@ class VLMCaller:
 # Module 2: Document Processor & Converter
 # ==============================================================================
 def convert_office_to_pdf(input_path: Path) -> None:
-    """
-    使用 LibreOffice 将 Word 或 PPT 转换为 PDF。
-
-    Args:
-        input_path: 原始 Office 文件路径
-    """
+    """使用 LibreOffice 将 Word 或 PPT 转换为 PDF。"""
     output_dir = input_path.parent
     expected_pdf_path = output_dir / f"{input_path.stem}.pdf"
 
@@ -170,48 +153,58 @@ def _get_item_image(item, doc) -> Image.Image | None:
                 return pil_img
     except Exception:
         pass
-
     try:
         img_ref = getattr(item, "image", None)
         if img_ref is not None:
             return img_ref.pil_image()
     except Exception:
         pass
-
     return None
 
 
 def _table_to_markdown(table_item: TableItem, doc) -> str:
-    """将 Docling TableItem 转换为 Markdown 表格，强制展开合并单元格。"""
+    """
+    终极兜底方案：纯 Python 坐标网格拆分器。
+    当 30B 模型罢工时，用这段代码强行拆分合并单元格，防数据丢失。
+    """
     try:
         num_rows = table_item.data.num_rows
         num_cols = table_item.data.num_cols
+
         if num_rows == 0 or num_cols == 0:
             return ""
 
-        # 初始化空白矩阵，遍历每个 cell 将其文本填充到所覆盖的全部坐标
         grid = [["" for _ in range(num_cols)] for _ in range(num_rows)]
+
         for cell in table_item.data.table_cells:
             text = cell.text.replace("\n", " ").strip() if cell.text else ""
-            for r in range(cell.start_row_offset_idx, cell.end_row_offset_idx + 1):
-                for c in range(cell.start_col_offset_idx, cell.end_col_offset_idx + 1):
+            start_r = cell.start_row_offset_idx
+            end_r = cell.end_row_offset_idx
+            start_c = cell.start_col_offset_idx
+            end_c = cell.end_col_offset_idx
+
+            for r in range(start_r, end_r + 1):
+                for c in range(start_c, end_c + 1):
                     if r < num_rows and c < num_cols:
                         grid[r][c] = text
 
-        lines: list[str] = []
+        lines = []
         for r, row in enumerate(grid):
             lines.append("| " + " | ".join(row) + " |")
             if r == 0:
-                lines.append("| " + " | ".join("---" for _ in range(num_cols)) + " |")
+                lines.append("| " + " | ".join(["---"] * num_cols) + " |")
+
         return "\n".join(lines)
-    except Exception:
+
+    except Exception as e:
+        _log.warning(f"自定义表格降维解析失败，返回空: {e}")
         return ""
 
 
 def _strip_vlm_code_fence(text: str) -> str:
     """去掉 VLM 多余的 ```markdown / ``` 包裹，保留纯 Markdown 内容。"""
     text = text.strip()
-    fence_patterns = ["```markdown", "```md", "```"]
+    fence_patterns = ["```markdown", "```md", "```latex", "```"]
     for fence in fence_patterns:
         if text.startswith(fence) and text.rstrip().endswith("```"):
             inner = text[len(fence):]
@@ -222,7 +215,7 @@ def _strip_vlm_code_fence(text: str) -> str:
 
 
 def _is_table_or_figure_caption(text: str) -> bool:
-    """检测文本是否为表格/图片标题，如 '表 4.4.4'、'图 1.2-3' 等。"""
+    """检测文本是否为表格/图片标题。"""
     import re as _re
     return bool(_re.match(r"[表图]\s*\d+(?:[\.-]\d+)*", text))
 
@@ -246,21 +239,19 @@ def _render_text_item(item, tree_depth: int) -> str:
 
 
 def process_document(input_path: Path, vlm: VLMCaller | None) -> str:
-    """
-    使用 Docling (+ VLM) 解析单个文档为 Markdown。
-
-    Args:
-        input_path: PDF 文件路径
-        vlm: VLM 调用器实例，为 None 时使用纯 Docling 模式
-
-    Returns:
-        生成的 Markdown 文本
-    """
+    """使用 Docling (+ VLM) 解析单个文档为 Markdown。"""
     if not input_path.exists():
         raise FileNotFoundError(f"文件不存在: {input_path}")
 
     pipeline_options = PdfPipelineOptions()
     pipeline_options.images_scale = 2.0
+
+    # 🛡️ 终极护城河：开启表格结构识别以截图发给 VLM，但强制底层模型在 CPU 运行，保住 5090 显存！
+    pipeline_options.do_table_structure = True
+    pipeline_options.accelerator_options = AcceleratorOptions(
+        num_threads=8,  # 调用 CPU 核心计算，绝不抢占 GPU
+        device=AcceleratorDevice.CPU
+    )
 
     if vlm is not None:
         pipeline_options.generate_page_images = True
@@ -282,13 +273,11 @@ def process_document(input_path: Path, vlm: VLMCaller | None) -> str:
         label = item.label
 
         if label in _VLM_LABELS:
-            # 先 flush 上一个 pending（正常情况不会堆积）
             if pending:
                 output.extend(pending)
                 pending = []
 
             vlm_result = ""
-
             if vlm is not None:
                 img = _get_item_image(item, doc)
                 if img is not None:
@@ -297,16 +286,21 @@ def process_document(input_path: Path, vlm: VLMCaller | None) -> str:
             if vlm_result:
                 vlm_result = _strip_vlm_code_fence(vlm_result)
                 if label == DocItemLabel.FORMULA and not (
-                    vlm_result.startswith("$") or vlm_result.startswith("\\[")
+                        vlm_result.startswith("$") or vlm_result.startswith("\\[")
                 ):
                     pending = [f"$$\n{vlm_result}\n$$", ""]
                 else:
                     pending = [vlm_result, ""]
 
+            # 🛡️ 容灾兜底机制：如果 30B 巨兽超时失败，且当前是个表格，立刻呼叫 Python 引擎救场
             elif isinstance(item, TableItem):
+                if vlm is not None:
+                    _log.warning("⚠️ 30B VLM 处理表格失败或超时，降级调用 Python 坐标引擎强行提取。")
                 fallback = _table_to_markdown(item, doc)
                 if fallback:
                     pending = [fallback, ""]
+
+            # 公式解析失败
             elif label == DocItemLabel.FORMULA:
                 text = getattr(item, "text", "") or ""
                 text = text.strip()
@@ -324,7 +318,7 @@ def process_document(input_path: Path, vlm: VLMCaller | None) -> str:
             rendered = _render_text_item(item, level)
             if rendered:
                 if pending and _is_table_or_figure_caption(rendered):
-                    # 标题应放在表格/图片之前
+                    # 标题倒装：标题放在表格/图片之前
                     pending = [rendered, ""] + pending
                     output.extend(pending)
                 else:
@@ -334,7 +328,6 @@ def process_document(input_path: Path, vlm: VLMCaller | None) -> str:
                     output.append("")
                 pending = []
 
-    # 末尾未消耗的 pending
     if pending:
         output.extend(pending)
 
@@ -345,21 +338,13 @@ def process_document(input_path: Path, vlm: VLMCaller | None) -> str:
 # Module 3: File Traversal & Main
 # ==============================================================================
 def main(use_vlm: bool, full_rebuild: bool = False) -> None:
-    """
-    文档清洗主流程。
-
-    Args:
-        use_vlm: 是否启用视觉大模型辅助识别
-        full_rebuild: 是否强制全量清洗（跳过增量检测）
-    """
+    """文档清洗主流程。"""
     start_time = time.time()
 
-    # 确保输入输出目录存在
     for input_dir, output_dir in _INPUT_DIRS.items():
         input_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 步骤 1：扫描并转换所有 Office 文件为 PDF
     office_files: list[Path] = []
     for input_dir in _INPUT_DIRS:
         if input_dir.exists():
@@ -372,7 +357,6 @@ def main(use_vlm: bool, full_rebuild: bool = False) -> None:
         for f in tqdm(office_files, desc="转换进度", unit="file"):
             convert_office_to_pdf(f)
 
-    # 步骤 2：收集 PDF 文件进行清洗
     pdf_files: list[tuple[Path, Path]] = []
     for input_dir, output_dir in _INPUT_DIRS.items():
         if input_dir.exists():
@@ -384,7 +368,6 @@ def main(use_vlm: bool, full_rebuild: bool = False) -> None:
         _log.info("未在目录中找到任何 PDF 文件可供清洗。")
         return
 
-    # 增量检测：跳过未变更的 PDF
     old_hashes = {} if full_rebuild else load_hash_cache(config.CLEANER_CACHE_FILE)
     to_process: list[tuple[Path, Path]] = []
     skipped = 0
@@ -428,7 +411,6 @@ def main(use_vlm: bool, full_rebuild: bool = False) -> None:
             _log.error("处理失败: %s\n%s", input_path.name, traceback.format_exc())
             failed += 1
 
-    # 合并哈希缓存
     if not full_rebuild:
         for key, val in old_hashes.items():
             if key not in new_hashes:
@@ -439,13 +421,7 @@ def main(use_vlm: bool, full_rebuild: bool = False) -> None:
     elapsed_seconds = end_time - start_time
     m, s = divmod(elapsed_seconds, 60)
     h, m = divmod(m, 60)
-
-    if h > 0:
-        time_str = f"{int(h)}小时 {int(m)}分钟 {s:.2f}秒"
-    elif m > 0:
-        time_str = f"{int(m)}分钟 {s:.2f}秒"
-    else:
-        time_str = f"{s:.2f}秒"
+    time_str = f"{int(h)}小时 {int(m)}分钟 {s:.2f}秒" if h > 0 else f"{int(m)}分钟 {s:.2f}秒" if m > 0 else f"{s:.2f}秒"
 
     print(f"\n清洗任务完成。成功: {success}, 失败: {failed}")
     print(f"总耗时: {time_str}")
@@ -453,7 +429,7 @@ def main(use_vlm: bool, full_rebuild: bool = False) -> None:
 
 if __name__ == "__main__":
     if config.USE_VLM:
-        print("\n模式: [Docling + 视觉大模型] 联合解析模式已开启")
+        print("\n模式: [Docling (CPU寻边) + 视觉大模型 (GPU解析)] 联合解析模式已开启")
         try:
             load_model("vlm", gpu_ratio="max")
             main(use_vlm=True)
