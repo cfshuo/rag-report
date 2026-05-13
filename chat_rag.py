@@ -313,45 +313,7 @@ def chat_loop() -> None:
 
         print("🤖 专家回答: \n", end="", flush=True)
 
-        def _do_stream() -> tuple[list[str], str | None, str]:
-            """流式请求，返回 (output_parts, finish_reason, error_msg)。"""
-            output: list[str] = []
-            pending = ""
-            fr = None
-            response = _client.chat.completions.create(
-                model=config.LLM_MODEL_NAME,
-                messages=messages,
-                temperature=0.1,
-                stream=True,
-                timeout=60.0,
-            )
-            for chunk in response:
-                choices = getattr(chunk, "choices", None)
-                if choices and len(choices) > 0:
-                    choice = choices[0]
-                    delta = getattr(choice, "delta", None)
-                    if delta is not None:
-                        content = getattr(delta, "content", None)
-                        if content:
-                            output.append(content)
-                            pending += content
-                            if len(pending) > 20 and not re.search(r'[\\\^\{\$]$', pending):
-                                cleaned = _clean_model_output(pending)
-                                if cleaned:
-                                    print(cleaned, end="", flush=True)
-                                pending = ""
-                    fr2 = getattr(choice, "finish_reason", None)
-                    if fr2:
-                        fr = fr2
-            # 刷出缓冲
-            if pending.strip():
-                cleaned = _clean_model_output(pending)
-                if cleaned:
-                    print(cleaned, end="", flush=True)
-            return output, fr, ""
-
-        def _do_non_stream() -> str:
-            """非流式请求，返回清洗后的回答文本。"""
+        try:
             resp = _client.chat.completions.create(
                 model=config.LLM_MODEL_NAME,
                 messages=messages,
@@ -359,68 +321,20 @@ def chat_loop() -> None:
                 stream=False,
                 timeout=120.0,
             )
-            content = resp.choices[0].message.content if resp.choices else ""
-            return _clean_model_output(content.strip()) if content and content.strip() else ""
-
-        try:
-            output_parts, finish_reason, stream_err = _do_stream()
-
-            if output_parts:
-                # 流式成功，输出换行和来源
-                print("")
+            raw = resp.choices[0].message.content if resp.choices else ""
+            if raw and raw.strip():
+                cleaned = _clean_model_output(raw.strip())
+                print(cleaned if cleaned else raw.strip())
                 print("\n📑 [参考来源]:")
                 for s in sorted(source_files):
                     print(f"- {s}")
-
-            elif stream_err:
-                # 流式抛出异常，回退非流式
-                _log.warning("流式异常: %s，回退非流式", stream_err)
-                print("\n[流式超时，切换非流式请求...]")
-                cleaned = _do_non_stream()
-                if cleaned:
-                    print(cleaned)
-                    print("\n📑 [参考来源]:")
-                    for s in sorted(source_files):
-                        print(f"- {s}")
-                else:
-                    print("[系统提示：模型未返回有效内容]")
-
             else:
-                # 流式完成但无内容，回退非流式
-                _log.warning(
-                    "流式响应无内容 — finish_reason=%s, query=%.80s",
-                    finish_reason, user_query,
-                )
-                print("[流式无内容，切换非流式请求...]")
-                cleaned = _do_non_stream()
-                if cleaned:
-                    print(cleaned)
-                    print("\n📑 [参考来源]:")
-                    for s in sorted(source_files):
-                        print(f"- {s}")
-                else:
-                    print("[系统提示：模型未返回有效内容]")
-                    if finish_reason:
-                        print(f"[调试: finish_reason={finish_reason}]")
-                        if finish_reason == "length":
-                            print("[提示: 上下文可能超过模型最大长度]")
+                _log.warning("模型返回空内容 — query=%.80s", user_query)
+                print("[系统提示：模型未返回有效内容]")
 
         except Exception as e:
             _log.error("模型生成异常: %s", e)
-            # 流式异常后尝试非流式兜底
-            try:
-                print("[连接异常，切换非流式请求...]")
-                cleaned = _do_non_stream()
-                if cleaned:
-                    print(cleaned)
-                    print("\n📑 [参考来源]:")
-                    for s in sorted(source_files):
-                        print(f"- {s}")
-                else:
-                    print("[系统提示：模型未返回有效内容]")
-            except Exception as e2:
-                _log.error("非流式回退也失败: %s", e2)
-                print(f"\n模型生成异常: {e}")
+            print(f"\n模型生成异常: {e}")
 
 
 if __name__ == "__main__":
