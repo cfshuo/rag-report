@@ -37,6 +37,12 @@ LOG_DIR.mkdir(exist_ok=True)
 # 增量嵌入缓存文件 (记录已处理文件的哈希值)
 EMBEDDING_CACHE_FILE = DATA_DIR / "chroma" / ".file_hashes.json"
 
+# 增量清洗缓存 (PDF → MD 的哈希映射)
+CLEANER_CACHE_FILE = DATA_DIR / "cleaned" / ".cleaner_hashes.json"
+
+# 增量提取缓存 (MD → JSON 的哈希映射)
+EXTRACTOR_CACHE_FILE = DATA_DIR / "cleaned" / ".extractor_hashes.json"
+
 # ==========================================
 # 2. 模型与 API 配置
 # ==========================================
@@ -50,17 +56,18 @@ VLM_MODEL_NAME = "opengvlab_internvl3_5-8b"
 EMBEDDING_MODEL_NAME = "text-embedding-bge-m3"
 
 # 逻辑推理大模型 (用于 information_extract 和 chat_rag)
-LLM_MODEL_NAME = "qwen/qwen3.5-35b-a3b"
+# 备选: "qwen/qwen3.5-35b-a3b" (35B MoE, 22GB, 质量高但慢)
+LLM_MODEL_NAME = "qwen/qwen3.5-9b"
 
 # GPU 显存分配比例
 GPU_OFFLOAD: Dict[str, str] = {
     "vlm":       "max",   # InternVL 视觉模型
-    "embedding": "0.2",   # bge-m3 向量模型
-    "llm":       "0.8",  # Qwen 35B 推理模型 (max 会 OOM，22GB 模型装不进 ~22GB 空闲显存)
+    "embedding": "max",   # bge-m3 向量模型 (634MB, 全上 GPU)
+    "llm":       "max",   # Qwen 9B 推理模型 (6.5GB, 轻松全上 GPU)
 }
 
 # 推理上下文长度
-LLM_CONTEXT_LENGTH = 16384
+LLM_CONTEXT_LENGTH = 32768
 EMBEDDING_CONTEXT_LENGTH = 4096
 
 # VLM 调用配置
@@ -121,6 +128,7 @@ VLM_SYSTEM_PROMPT = (
     "你是一个严谨的工程文档数据提取专家。请将图片中的表格精准转换为 Markdown 表格，"
     "或将图片中的数学公式转换为 LaTeX 格式（行内使用 $...$，独立公式使用 $$...$$）。"
     "只输出 Markdown 或 LaTeX 代码，不要解释。"
+    "在解析表格并转换为 Markdown 格式时，由于 Markdown 原生不支持单元格的跨行(rowspan)或跨列(colspan)合并，你必须遵守以下铁律：对于表格中的合并单元格，请务必将其文本内容【完整复制并拆分填充】到每一个对应的 Markdown 独立单元格中！严禁在合并对应的下方或右侧单元格中留空。确保每一行的数据独立且完整！"
 )
 VLM_USER_TEXT = "请提取这张图片中的核心信息并转化为代码格式："
 IMAGE_PLACEHOLDER = ""

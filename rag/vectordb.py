@@ -198,12 +198,12 @@ def build_vector_database_incremental() -> None:
     new_hash_cache: dict[str, str] = {}
 
     for file_path_str in tqdm(changed, desc="处理变更文档", unit="份"):
-        fp, doc_type = file_map[file_path_str]
+        fp, doc_type = file_map[str(file_path_str)]
         chunks = _slice_document(fp, doc_type)
         all_chunks.extend(chunks)
         file_hash = compute_file_hash(fp)
         if file_hash:
-            new_hash_cache[file_path_str] = file_hash
+            new_hash_cache[str(file_path_str)] = file_hash
 
     # 保留未变更文件的哈希
     for fp in unchanged_files:

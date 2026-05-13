@@ -22,7 +22,7 @@ env/
 # Claude Code
 .claude/settings.local.json
 
-# Data directories (runtime artifacts — large PDFs, markdown, chroma DB)
+# Data directories — runtime artifacts excluded; directory structure tracked via .gitkeep
 data/input/
 data/cleaned/
 data/chroma/

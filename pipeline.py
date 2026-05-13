@@ -31,20 +31,23 @@ os.environ["PYTHONIOENCODING"] = "utf-8"
 _log = setup_logging("pipeline")
 
 
-def step_clean() -> bool:
+def step_clean(full_rebuild: bool = False) -> bool:
     """
     执行文档清洗步骤。
+
+    Args:
+        full_rebuild: 是否强制全量清洗
 
     Returns:
         True 表示成功
     """
     print("\n" + "=" * 60)
-    print("  步骤 1/3: 文档清洗 (Docling + VLM)")
+    print(f"  步骤 1/3: 文档清洗 (Docling + VLM) {'(全量)' if full_rebuild else '(增量)'}")
     print("=" * 60)
     try:
         from rag import cleaner
         load_model("vlm", gpu_ratio="max")
-        cleaner.main(use_vlm=config.USE_VLM)
+        cleaner.main(use_vlm=config.USE_VLM, full_rebuild=full_rebuild)
         unload_all()
         return True
     except Exception as e:
@@ -53,20 +56,23 @@ def step_clean() -> bool:
         return False
 
 
-def step_extract() -> bool:
+def step_extract(full_rebuild: bool = False) -> bool:
     """
     执行信息提取步骤。
+
+    Args:
+        full_rebuild: 是否强制全量提取
 
     Returns:
         True 表示成功
     """
     print("\n" + "=" * 60)
-    print("  步骤 2/3: 元数据提取 (LLM)")
+    print(f"  步骤 2/3: 元数据提取 (LLM) {'(全量)' if full_rebuild else '(增量)'}")
     print("=" * 60)
     try:
         from rag import extractor
         load_model("llm", gpu_ratio="max")
-        extractor.process_markdown_files()
+        extractor.process_markdown_files(full_rebuild=full_rebuild)
         unload_all()
         return True
     except Exception as e:
@@ -143,8 +149,8 @@ def run_pipeline(
     start_time = time.time()
 
     step_funcs = {
-        "clean": lambda: step_clean(),
-        "extract": lambda: step_extract(),
+        "clean": lambda: step_clean(full_rebuild=full_rebuild),
+        "extract": lambda: step_extract(full_rebuild=full_rebuild),
         "build": lambda: step_build(full_rebuild=full_rebuild),
     }
 

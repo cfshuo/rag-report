@@ -9,23 +9,37 @@ Usage:
     python chat_rag.py
 """
 
+import logging
+import readline  # noqa: F401 — 强制激活终端行编辑（退格/方向键/历史）
 import re
 import sys
+import warnings
 from pathlib import Path
 from typing import Set
 
+# 抑制第三方库的 deprecation 噪音
+warnings.filterwarnings("ignore", message=".*LangChain.*")
+
 from openai import OpenAI
 from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 
 import config
 from rag.utils.logging_config import setup_logging
 from rag.utils.lms import load_both_models, unload_models
 
-_log = setup_logging("chat_rag")
+_log = setup_logging("chat_rag", level=logging.WARNING)
 
 # 初始化 OpenAI 兼容客户端 (指向本地 LM Studio)
 _client = OpenAI(base_url=config.API_BASE_URL, api_key=config.API_KEY)
+
+
+def _safe_input(prompt: str = "") -> str:
+    """带提示的 input，fallback 处理 UTF-8 边界异常。"""
+    try:
+        return input(prompt)
+    except UnicodeDecodeError:
+        return input(prompt)
 
 # 条款编号匹配模式
 _CLAUSE_PATTERNS = [
@@ -44,28 +58,38 @@ def _extract_clause_numbers(query: str) -> set[str]:
 
 def _hybrid_retrieval(db, query: str, top_k: int):
     """
-    混合检索：向量语义搜索 + 条款编号文本匹配重排序。
+    混合检索：向量语义搜索 + 条款编号文本匹配。
 
-    当查询包含条款编号时，扩大召回范围并用文本匹配提升精度。
+    当查询包含条款编号时，直接从全库搜索包含该编号的 chunk，
+    再与语义结果合并，确保条款命中优先。
     """
     clause_nums = _extract_clause_numbers(query)
-    fetch_k = max(top_k * 4, 12) if clause_nums else top_k
-    docs = db.similarity_search(query, k=fetch_k)
-
     if not clause_nums:
-        return docs[:top_k]
+        return db.similarity_search(query, k=top_k)
 
-    # 文本匹配加分：chunk 内容命中条款编号的排前面
-    scored = []
-    for doc in docs:
-        score = sum(1 for num in clause_nums if num in doc.page_content)
-        scored.append((score, doc))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    reranked = [doc for _, doc in scored]
+    # 条款编号查询：直接从全库文本搜索
+    all_docs = db.get()
+    clause_hits = []
+    for doc_content, meta in zip(all_docs["documents"], all_docs["metadatas"]):
+        for num in clause_nums:
+            if num in doc_content:
+                from langchain_core.documents import Document
+                clause_hits.append(Document(page_content=doc_content, metadata=meta))
+                break
 
-    if not any(s > 0 for s, _ in scored):
-        _log.info("条款编号 %s 未在任何 chunk 中命中，回退纯语义结果", clause_nums)
-    return reranked[:top_k]
+    if clause_hits:
+        _log.info("条款编号 %s 文本命中 %d 个 chunk", clause_nums, len(clause_hits))
+        # 条款命中优先，语义结果补充
+        semantic_docs = db.similarity_search(query, k=top_k)
+        seen = {doc.page_content for doc in clause_hits}
+        for doc in semantic_docs:
+            if doc.page_content not in seen:
+                clause_hits.append(doc)
+                seen.add(doc.page_content)
+        return clause_hits[:max(top_k, len(clause_hits))]
+
+    _log.info("条款编号 %s 全库未命中，回退纯语义结果", clause_nums)
+    return db.similarity_search(query, k=top_k)
 
 
 def _build_context(docs) -> tuple[str, Set[str]]:
@@ -74,24 +98,47 @@ def _build_context(docs) -> tuple[str, Set[str]]:
     source_files: Set[str] = set()
 
     for i, doc in enumerate(docs):
-        proj = doc.metadata.get("项目名称", "未知项目")
-        fname = doc.metadata.get("来源文件", "未知文件")
-        year = doc.metadata.get("编制年份", "未知年份")
-        loc = doc.metadata.get("海域位置", "未知位置")
-        stage = doc.metadata.get("设计阶段", "未知阶段")
+        meta = doc.metadata
+        doc_type = meta.get("文档类型", "")
+        fname = meta.get("来源文件", "未知文件")
 
         context_text += f"\n【参考资料 {i + 1}】"
-        context_text += f"\n- 项目名称: {proj}"
-        context_text += f"\n- 编制年份: {year}"
-        context_text += f"\n- 海域位置: {loc}"
-        context_text += f"\n- 设计阶段: {stage}"
+
+        if doc_type == "规范":
+            std_name = meta.get("标准名称", "") or _extract_std_name_from_filename(fname)
+            std_code = meta.get("标准编号", "")
+            context_text += f"\n- 文档类型: 规范"
+            if std_code:
+                context_text += f"\n- 标准编号: {std_code}"
+            context_text += f"\n- 标准名称: {std_name}"
+            # 参考来源格式: 《规范名》 (编号)
+            ref = f"《{std_name}》"
+            if std_code:
+                ref += f" ({std_code})"
+            source_files.add(ref)
+        else:
+            proj = meta.get("项目名称", "未知项目")
+            year = meta.get("编制年份", "未知年份")
+            loc = meta.get("海域位置", "未知位置")
+            stage = meta.get("设计阶段", "未知阶段")
+            context_text += f"\n- 项目名称: {proj}"
+            context_text += f"\n- 编制年份: {year}"
+            context_text += f"\n- 海域位置: {loc}"
+            context_text += f"\n- 设计阶段: {stage}"
+            # 参考来源格式: 项目名, 年份, 海域, 阶段
+            source_files.add(f"{proj}, {year}, {loc}, {stage}")
+
         context_text += f"\n- 来源文件: {fname}"
         context_text += f"\n[正文片段内容:\n{doc.page_content}\n"
         context_text += "-" * 30 + "\n"
 
-        source_files.add(f"{proj} ({fname})")
-
     return context_text, source_files
+
+
+def _extract_std_name_from_filename(filename: str) -> str:
+    """从文件名中提取规范名称，如 '《XXX》出版稿2019.md' → 'XXX'。"""
+    m = re.search(r"《(.+?)》", filename)
+    return m.group(1) if m else filename
 
 
 def _build_system_prompt(context_text: str) -> str:
@@ -138,7 +185,7 @@ def chat_loop() -> None:
 
     while True:
         try:
-            user_query = input("\n工程师提问: ")
+            user_query = _safe_input("\n工程师提问: ")
         except (EOFError, KeyboardInterrupt):
             print("\n用户退出。")
             break
@@ -183,7 +230,7 @@ def chat_loop() -> None:
                         print(content, end="", flush=True)
                         full_answer += content
 
-            print("\n\n[参考来源]:")
+            print("\n[参考来源]:")
             for s in sorted(source_files):
                 print(f"- {s}")
 

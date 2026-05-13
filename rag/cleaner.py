@@ -37,6 +37,7 @@ from PIL import Image
 from tqdm import tqdm
 
 import config
+from rag.utils.hashing import compute_file_hash, load_hash_cache, save_hash_cache
 from rag.utils.logging_config import setup_logging
 from rag.utils.lms import load_model, unload_all, stop_server
 
@@ -181,37 +182,49 @@ def _get_item_image(item, doc) -> Image.Image | None:
 
 
 def _table_to_markdown(table_item: TableItem, doc) -> str:
-    """将 Docling TableItem 转换为 Markdown 表格 (VLM 失败时的回退)。"""
+    """将 Docling TableItem 转换为 Markdown 表格，强制展开合并单元格。"""
     try:
-        if hasattr(table_item, "export_to_markdown"):
-            return table_item.export_to_markdown(doc=doc)
-
-        grid = getattr(table_item.data, "grid", [])
-        if callable(grid):
-            grid = grid()
-
-        if not grid:
+        num_rows = table_item.data.num_rows
+        num_cols = table_item.data.num_cols
+        if num_rows == 0 or num_cols == 0:
             return ""
+
+        # 初始化空白矩阵，遍历每个 cell 将其文本填充到所覆盖的全部坐标
+        grid = [["" for _ in range(num_cols)] for _ in range(num_rows)]
+        for cell in table_item.data.table_cells:
+            text = cell.text.replace("\n", " ").strip() if cell.text else ""
+            for r in range(cell.start_row_offset_idx, cell.end_row_offset_idx + 1):
+                for c in range(cell.start_col_offset_idx, cell.end_col_offset_idx + 1):
+                    if r < num_rows and c < num_cols:
+                        grid[r][c] = text
 
         lines: list[str] = []
         for r, row in enumerate(grid):
-            if hasattr(row, "cells"):
-                cells = [
-                    cell.text.replace("\n", " ") if hasattr(cell, "text") else ""
-                    for cell in row.cells
-                ]
-            else:
-                cells = [
-                    str(cell).replace("\n", " ") if hasattr(cell, "text") else str(cell)
-                    for cell in row
-                ]
-
-            lines.append("| " + " | ".join(cells) + " |")
+            lines.append("| " + " | ".join(row) + " |")
             if r == 0:
-                lines.append("| " + " | ".join("---" for _ in cells) + " |")
+                lines.append("| " + " | ".join("---" for _ in range(num_cols)) + " |")
         return "\n".join(lines)
     except Exception:
         return ""
+
+
+def _strip_vlm_code_fence(text: str) -> str:
+    """去掉 VLM 多余的 ```markdown / ``` 包裹，保留纯 Markdown 内容。"""
+    text = text.strip()
+    fence_patterns = ["```markdown", "```md", "```"]
+    for fence in fence_patterns:
+        if text.startswith(fence) and text.rstrip().endswith("```"):
+            inner = text[len(fence):]
+            if inner.endswith("```"):
+                inner = inner[:-3]
+            return inner.strip()
+    return text
+
+
+def _is_table_or_figure_caption(text: str) -> bool:
+    """检测文本是否为表格/图片标题，如 '表 4.4.4'、'图 1.2-3' 等。"""
+    import re as _re
+    return bool(_re.match(r"[表图]\s*\d+(?:[\.-]\d+)*", text))
 
 
 def _render_text_item(item, tree_depth: int) -> str:
@@ -263,11 +276,17 @@ def process_document(input_path: Path, vlm: VLMCaller | None) -> str:
     result = converter.convert(input_path)
     doc = result.document
     output: list[str] = []
+    pending: list[str] = []  # 暂存最近一个表格/图片的输出行，等待可能跟随的标题
 
     for item, level in doc.iterate_items():
         label = item.label
 
         if label in _VLM_LABELS:
+            # 先 flush 上一个 pending（正常情况不会堆积）
+            if pending:
+                output.extend(pending)
+                pending = []
+
             vlm_result = ""
 
             if vlm is not None:
@@ -276,39 +295,48 @@ def process_document(input_path: Path, vlm: VLMCaller | None) -> str:
                     vlm_result = vlm.query(img)
 
             if vlm_result:
+                vlm_result = _strip_vlm_code_fence(vlm_result)
                 if label == DocItemLabel.FORMULA and not (
                     vlm_result.startswith("$") or vlm_result.startswith("\\[")
                 ):
-                    output.append(f"$$\n{vlm_result}\n$$")
+                    pending = [f"$$\n{vlm_result}\n$$", ""]
                 else:
-                    output.append(vlm_result)
-                output.append("")
+                    pending = [vlm_result, ""]
 
             elif isinstance(item, TableItem):
                 fallback = _table_to_markdown(item, doc)
                 if fallback:
-                    output.append(fallback)
-                    output.append("")
+                    pending = [fallback, ""]
             elif label == DocItemLabel.FORMULA:
                 text = getattr(item, "text", "") or ""
                 text = text.strip()
                 if text:
                     if text.startswith("$$") or text.startswith("\\[") or text.startswith("$"):
-                        output.append(text)
+                        pending = [text, ""]
                     else:
-                        output.append(f"$$\n{text}\n$$")
-                    output.append("")
+                        pending = [f"$$\n{text}\n$$", ""]
                 else:
-                    output.append("\n> **公式元素解析失败**\n")
+                    pending = ["\n> **公式元素解析失败**\n", ""]
             else:
-                output.append(config.IMAGE_PLACEHOLDER)
-                output.append("")
+                pending = [config.IMAGE_PLACEHOLDER, ""]
 
         else:
             rendered = _render_text_item(item, level)
             if rendered:
-                output.append(rendered)
-                output.append("")
+                if pending and _is_table_or_figure_caption(rendered):
+                    # 标题应放在表格/图片之前
+                    pending = [rendered, ""] + pending
+                    output.extend(pending)
+                else:
+                    if pending:
+                        output.extend(pending)
+                    output.append(rendered)
+                    output.append("")
+                pending = []
+
+    # 末尾未消耗的 pending
+    if pending:
+        output.extend(pending)
 
     return "\n".join(output)
 
@@ -316,12 +344,13 @@ def process_document(input_path: Path, vlm: VLMCaller | None) -> str:
 # ==============================================================================
 # Module 3: File Traversal & Main
 # ==============================================================================
-def main(use_vlm: bool) -> None:
+def main(use_vlm: bool, full_rebuild: bool = False) -> None:
     """
     文档清洗主流程。
 
     Args:
         use_vlm: 是否启用视觉大模型辅助识别
+        full_rebuild: 是否强制全量清洗（跳过增量检测）
     """
     start_time = time.time()
 
@@ -355,13 +384,35 @@ def main(use_vlm: bool) -> None:
         _log.info("未在目录中找到任何 PDF 文件可供清洗。")
         return
 
-    print(f"\n格式化完毕，共准备清洗 {len(pdf_files)} 个 PDF 文件。")
+    # 增量检测：跳过未变更的 PDF
+    old_hashes = {} if full_rebuild else load_hash_cache(config.CLEANER_CACHE_FILE)
+    to_process: list[tuple[Path, Path]] = []
+    skipped = 0
+    for input_path, output_dir in pdf_files:
+        output_path = output_dir / f"{input_path.stem}.md"
+        current_hash = compute_file_hash(input_path)
+        if not full_rebuild and output_path.exists() and current_hash:
+            key = str(input_path)
+            if key in old_hashes and old_hashes[key] == current_hash:
+                skipped += 1
+                continue
+        to_process.append((input_path, output_dir))
 
+    if skipped:
+        print(f"\n增量模式：跳过 {skipped} 份未变更的 PDF，待清洗 {len(to_process)} 份。")
+    else:
+        print(f"\n格式化完毕，共准备清洗 {len(to_process)} 个 PDF 文件。")
+
+    if not to_process:
+        print("所有文档已是最新，无需清洗。")
+        return
+
+    new_hashes: dict[str, str] = {}
     vlm = VLMCaller() if use_vlm else None
     success = 0
     failed = 0
 
-    for input_path, output_dir in tqdm(pdf_files, desc="清洗进度", unit="file"):
+    for input_path, output_dir in tqdm(to_process, desc="清洗进度", unit="file"):
         tqdm.write(f"正在处理: {input_path.name}")
 
         try:
@@ -369,10 +420,20 @@ def main(use_vlm: bool) -> None:
             output_path = output_dir / f"{input_path.stem}.md"
             output_path.write_text(markdown_content, encoding="utf-8")
             _log.info("成功输出: %s", output_path.name)
+            file_hash = compute_file_hash(input_path)
+            if file_hash:
+                new_hashes[str(input_path)] = file_hash
             success += 1
         except Exception:
             _log.error("处理失败: %s\n%s", input_path.name, traceback.format_exc())
             failed += 1
+
+    # 合并哈希缓存
+    if not full_rebuild:
+        for key, val in old_hashes.items():
+            if key not in new_hashes:
+                new_hashes[key] = val
+    save_hash_cache(config.CLEANER_CACHE_FILE, new_hashes)
 
     end_time = time.time()
     elapsed_seconds = end_time - start_time

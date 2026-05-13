@@ -19,6 +19,7 @@ from openai import OpenAI
 from tqdm import tqdm
 
 import config
+from rag.utils.hashing import compute_file_hash, load_hash_cache, save_hash_cache
 from rag.utils.logging_config import setup_logging
 from rag.utils.lms import load_model, unload_all, stop_server
 
@@ -126,10 +127,13 @@ def extract_metadata_from_text(text_chunk: str, doc_type: str) -> dict:
     return {"状态": "调用失败", "错误详情": last_error}
 
 
-def process_markdown_files() -> None:
+def process_markdown_files(full_rebuild: bool = False) -> None:
     """
     主流程: 扫描清洗目录中的所有 Markdown 文件，逐份调用 LLM 提取元数据，
     结果写入同名 JSON 文件。
+
+    Args:
+        full_rebuild: 是否强制全量提取（跳过增量检测）
     """
     input_map = {
         config.CLEAN_REPORT_DIR: "report",
@@ -147,9 +151,32 @@ def process_markdown_files() -> None:
         print("未找到任何 .md 文件，请检查清洗文件夹。")
         return
 
-    print(f"\n共发现 {len(md_files)} 份文档，开始智能双轨提取...")
+    # 增量检测：跳过未变更的 MD
+    old_hashes = {} if full_rebuild else load_hash_cache(config.EXTRACTOR_CACHE_FILE)
+    to_process: list[tuple[Path, str]] = []
+    skipped = 0
+    for md_file, doc_type in md_files:
+        json_path = md_file.with_suffix(".json")
+        current_hash = compute_file_hash(md_file)
+        if not full_rebuild and json_path.exists() and current_hash:
+            key = str(md_file)
+            if key in old_hashes and old_hashes[key] == current_hash:
+                skipped += 1
+                continue
+        to_process.append((md_file, doc_type))
+
+    if skipped:
+        print(f"\n增量模式：跳过 {skipped} 份未变更的文档，待提取 {len(to_process)} 份。")
+    else:
+        print(f"\n共发现 {len(to_process)} 份文档，开始智能双轨提取...")
+
+    if not to_process:
+        print("所有文档已是最新，无需提取。")
+        return
+
+    new_hashes: dict[str, str] = {}
     success_count = 0
-    pbar = tqdm(md_files, desc="提取进度", unit="份")
+    pbar = tqdm(to_process, desc="提取进度", unit="份")
 
     for md_file, doc_type in pbar:
         pbar.set_description(f"读取 ({doc_type}): {md_file.name[:15]}...")
@@ -163,10 +190,20 @@ def process_markdown_files() -> None:
                 encoding="utf-8",
             )
             _log.info("提取 %s -> %s", md_file.name, metadata)
+            file_hash = compute_file_hash(md_file)
+            if file_hash:
+                new_hashes[str(md_file)] = file_hash
             success_count += 1
         except Exception as e:
             _log.exception("处理文件崩溃: %s", md_file.name)
             continue
+
+    # 合并哈希缓存
+    if not full_rebuild:
+        for key, val in old_hashes.items():
+            if key not in new_hashes:
+                new_hashes[key] = val
+    save_hash_cache(config.EXTRACTOR_CACHE_FILE, new_hashes)
 
     print(f"\n提取完成！成功处理了 {success_count} 份文档。")
 
