@@ -1,0 +1,24 @@
+[project]
+name = "rag-report"
+version = "1.0.0"
+description = "海洋工程水文气象 RAG 知识库系统"
+requires-python = ">=3.11"
+dependencies = [
+    "docling>=2.0",
+    "docling-core>=2.0",
+    "langchain>=0.3",
+    "langchain-openai>=0.2",
+    "langchain-community>=0.3",
+    "langchain-text-splitters>=0.3",
+    "openai>=1.0",
+    "chromadb>=0.5",
+    "pillow>=10.0",
+    "tqdm>=4.0",
+]
+
+[project.scripts]
+rag-pipeline = "pipeline:main"
+rag-chat = "chat_rag:chat_loop"
+
+[tool.setuptools.packages.find]
+include = ["rag*"]
