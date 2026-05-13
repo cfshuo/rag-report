@@ -53,32 +53,29 @@ def _extract_clause_numbers(query: str) -> set[str]:
 
 
 def _hybrid_retrieval(db, query: str, top_k: int):
-    """混合检索：向量语义搜索 + 条款编号文本匹配。"""
+    """混合检索：向量语义搜索 + 条款编号定向向量检索（避免全库扫描）。"""
     clause_nums = _extract_clause_numbers(query)
     if not clause_nums:
         return db.similarity_search(query, k=top_k)
 
-    all_docs = db.get()
-    clause_hits = []
-    for doc_content, meta in zip(all_docs["documents"], all_docs["metadatas"]):
-        for num in clause_nums:
-            if num in doc_content:
-                from langchain_core.documents import Document
-                clause_hits.append(Document(page_content=doc_content, metadata=meta))
-                break
-
-    if clause_hits:
-        _log.info("条款编号 %s 文本命中 %d 个 chunk", clause_nums, len(clause_hits))
-        semantic_docs = db.similarity_search(query, k=top_k)
-        seen = {doc.page_content for doc in clause_hits}
-        for doc in semantic_docs:
+    # 条款编号定向向量检索 — 构造针对性的查询语句，走 HNSW 索引 O(log N)
+    seen: set[str] = set()
+    clause_hits: list = []
+    for num in clause_nums:
+        for doc in db.similarity_search(f"第{num}条 条款{num}", k=3):
             if doc.page_content not in seen:
                 clause_hits.append(doc)
                 seen.add(doc.page_content)
-        return clause_hits[:max(top_k, len(clause_hits))]
 
-    _log.info("条款编号 %s 全库未命中，回退纯语义结果", clause_nums)
-    return db.similarity_search(query, k=top_k)
+    _log.info("条款编号 %s 向量命中 %d 个 chunk", clause_nums, len(clause_hits))
+
+    # 主语义检索补充
+    for doc in db.similarity_search(query, k=top_k):
+        if doc.page_content not in seen:
+            clause_hits.append(doc)
+            seen.add(doc.page_content)
+
+    return clause_hits[:top_k]
 
 
 def _clean_display_name(name: str) -> str:
