@@ -223,14 +223,14 @@ def _clean_model_output(text: str) -> str:
 
 def _build_system_prompt(context_text: str) -> str:
     """
-    构建系统提示词，加入极其严格的格式约束，
-    强制模型输出纯文本，消灭 Markdown 和 LaTeX 乱码。
-    同时对参考资料中的 LaTeX 进行预处理转换，并截断过长上下文。
+    构建系统提示词。
+    解除对模型输出格式的死板限制，让 9B 模型发挥最自然的语言能力，
+    后续的终端纯净化交由 Python 的 _clean_model_output 函数处理。
     """
-    # 预处理：清洗参考资料中的 LaTeX/Markdown 格式，防止模型模仿
+    # 预处理：清洗参考资料中的 LaTeX/Markdown 格式，防止输入端污染
     clean_context = _clean_model_output(context_text)
 
-    # 上下文截断保护：保守估计中文每字 2 token，预留 1500 token 给系统提示 + 回答
+    # 上下文截断保护
     max_chars = max(1000, int((config.LLM_CONTEXT_LENGTH - 1500) * 0.6))
     if len(clean_context) > max_chars:
         clean_context = clean_context[:max_chars] + "\n...[上下文已截断]"
@@ -239,14 +239,10 @@ def _build_system_prompt(context_text: str) -> str:
     return (
         "你是一位专业的海洋水文气象高级工程师。\n"
         "请严谨地基于提供的【参考资料】来回答用户的问题。\n\n"
-        "【输出格式要求】：\n"
-        "1. 如果参考资料中是分条列出的规范条目（如1、2、3、4、5），请同样用 1、2、3、4、5 编号逐条列出回答。\n"
-        "2. 允许使用普通符号：> < ! @ # $ % ^ & * ~ ℃ 以及各种单位符号。\n"
-        "   数学关系用普通符号表达：大于等于写成>=、小于等于写成<=、不等于写成!=、加减写成+-。\n"
-        "   速度单位写成 cm/s 或 m/s，温度写成 25℃，百分比写成 XX%。\n"
-        "3. 禁止使用 Markdown 修饰符（**加粗**、*斜体*、#标题、`代码块`、>引用）。\n"
-        "4. 禁止使用 LaTeX 命令（反斜杠开头的命令如 \\frac、\\sqrt、\\ge 等），禁止使用 $$ 或 $ 定界符包裹公式。\n"
-        "5. 如果资料中没有相关信息，请直接回答：根据提供的资料，无法回答该问题。绝对不要编造数据。\n\n"
+        "【回答纪律】：\n"
+        "1. 请逻辑清晰、分点作答。如果涉及数学关系，尽量使用通俗易懂的文本描述。\n"
+        "2. 如果资料中没有相关信息，请直接回答：“根据提供的资料，无法回答该问题。”，绝对不要编造数据或凭空猜测。\n"
+        "3. 禁止使用任何 Markdown 格式（不要使用 **、*、#、```、___ 等符号），输出纯文本即可。\n\n"
         f"以下是相关参考资料：\n{clean_context}"
     )
 
@@ -315,19 +311,23 @@ def chat_loop() -> None:
                 model=config.LLM_MODEL_NAME,
                 messages=messages,
                 temperature=0.1,
+                max_tokens=config.MAX_OUTPUT_TOKENS,
                 stream=False,
                 timeout=120.0,
             )
-            raw = resp.choices[0].message.content if resp.choices else ""
-            if raw and raw.strip():
-                cleaned = _clean_model_output(raw.strip())
-                print(cleaned if cleaned else raw.strip())
+
+            full_response = resp.choices[0].message.content or ""
+
+            if not full_response.strip():
+                _log.warning("模型返回空内容 — query=%.80s", user_query)
+                print("[系统提示：模型未返回有效内容]")
+            else:
+                # 终端纯净输出：去除可能的 markdown 残留后直接打印
+                clean_text = _clean_model_output(full_response)
+                print(clean_text)
                 print("\n📑 [参考来源]:")
                 for s in sorted(source_files):
                     print(f"- {s}")
-            else:
-                _log.warning("模型返回空内容 — query=%.80s", user_query)
-                print("[系统提示：模型未返回有效内容]")
 
         except Exception as e:
             _log.error("模型生成异常: %s", e)

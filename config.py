@@ -62,11 +62,14 @@ LLM_MODEL_NAME = "qwen/qwen3.5-9b"
 GPU_OFFLOAD: Dict[str, str] = {
     "vlm":       "max",   # InternVL 30B 离线清洗，独占显存
     "embedding": "max",   # bge-m3 向量模型 (634MB)
-    "llm":       "max",   # Qwen 9B 推理模型，轻松全上 GPU
+    "llm":       "max",   # Qwen 3 8B 推理模型
 }
 
-# 推理上下文长度 (Qwen3.5-9B 支持 32K，设 16384 给充足余量避免上下文溢出导致空响应)
+# 推理上下文长度 (输入+输出总窗口，8192 兼顾 RAG 场景的响应速度)
 LLM_CONTEXT_LENGTH = 16384
+# 单次响应最大生成 token 数
+MAX_OUTPUT_TOKENS = 4096
+# 嵌入模型上下文窗口
 EMBEDDING_CONTEXT_LENGTH = 4096
 
 # VLM 调用配置
