@@ -106,14 +106,17 @@ def extract_metadata_from_text(text_chunk: str, doc_type: str) -> dict:
     last_error = ""
     for attempt in range(1 + MAX_RETRIES):
         try:
-            response = _client.chat.completions.create(
-                model=config.LLM_MODEL_NAME,
-                messages=[
+            api_kwargs: dict = {
+                "model": config.LLM_MODEL_NAME,
+                "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                temperature=0.0,
-            )
+                "temperature": 0.0,
+                "extra_body": {"reasoning_effort": config.REASONING_EFFORT},
+            }
+
+            response = _client.chat.completions.create(**api_kwargs)
             result_text = response.choices[0].message.content.strip()
             return _parse_json_response(result_text)
 

@@ -258,12 +258,13 @@ def _build_system_prompt(context_text: str) -> str:
         "    示例：「1. 远海风电场：场区离海缆路由登陆点所在岸线最近距离大于65km的风电场。」\n"
         "  - 单一事实问题（查数值、查定义）：用一段话直接给出精准答案，严禁强行分条。\n"
         "    对单一事实使用「第一」「第二」「第三」「第四」属于严重违规的凑字数行为。\n\n"
-        "=== 第三段：专家补充 / 发散思考 ===\n"
+        "=== 第三段：专家补充 ===\n"
         "以「注：」或「补充说明：」开头，基于当前问题给出有价值的专业关联信息，例如：\n"
         "  - 相关概念的对照对比（问深海，可补充浅海的界限作为对照；问远海，可补充近海的定义）\n"
         "  - 实际工程中的注意事项\n"
         "  - 与问题相关的上下游知识\n"
-        "此段展现你的专家视野，但须与问题密切相关，不得离题。\n\n"
+        "此段展现你的专家视野，但须与问题密切相关，不得离题。"
+        "如果检索到的【参考资料】未能完全覆盖用户提问的核心意图，请在这一段利用你作为高级工程师的专业知识，对缺失的核心环节进行延伸解答与纠偏\n\n"
         "---\n"
         "【正确示例 — 问「深远海的划分」】\n"
         "根据《海上风电场工程风能资源测量及海洋水文观测规范》（NB/T31029-2019），海上风电场根据离岸距离或场址水深大小进行划分，关于远海与深海的划分标准如下：\n"
@@ -278,7 +279,7 @@ def _build_system_prompt(context_text: str) -> str:
         "1. 输出纯文本，不要使用 Markdown 格式（不要用 **、*、#、``` 等符号）。\n"
         "2. 禁止描述参考资料的结构（如「该表格详细列出了...」是废话）。\n"
         "3. 禁止在结尾重复总结（如「因此，针对您询问的...」「综上所述...」）。答案只说一遍。\n"
-        "4. 如果资料中没有相关信息，请直接回答：「根据提供的资料，无法回答该问题。」，绝对不要编造数据。\n"
+        "4. 如果参考资料中没有直接对应的答案，请结合你自身的通用知识进行回答，并明确告知用户「参考资料中未找到详细评估标准，基于通用知识...」，绝对不要编造数据。\n"
         "5. 禁止在末尾单独输出参考文献名称或编号。参考文献由系统自动追加，你不需要画蛇添足。\n\n"
         f"以下是相关参考资料：\n{clean_context}"
     )
@@ -349,19 +350,33 @@ def chat_loop() -> None:
 
         try:
             t4 = time.time()
-            stream = _client.chat.completions.create(
-                model=config.LLM_MODEL_NAME,
-                messages=messages,
-                temperature=0.1,
-                max_tokens=config.MAX_OUTPUT_TOKENS,
-                stream=True,
-                timeout=120.0,
-            )
+            # 构建 API 调用参数
+            thinking_enabled = config.REASONING_EFFORT not in (None, "none")
+            api_kwargs: dict = {
+                "model": config.LLM_MODEL_NAME,
+                "messages": messages,
+                "temperature": 0.1,
+                "max_tokens": max(config.MAX_OUTPUT_TOKENS, 8192) if thinking_enabled else config.MAX_OUTPUT_TOKENS,
+                "stream": True,
+                "timeout": 120.0,
+                "extra_body": {"reasoning_effort": config.REASONING_EFFORT},
+            }
+
+            stream = _client.chat.completions.create(**api_kwargs)
 
             full_response = ""
+            reasoning = False
             for chunk in stream:
                 delta = chunk.choices[0].delta
+                if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+                    if not reasoning:
+                        print("正在推理...", end="", flush=True)
+                        reasoning = True
                 if delta.content:
+                    if reasoning:
+                        # 清除"正在推理..."，回到行首
+                        print("\r\033[K", end="", flush=True)
+                        reasoning = False
                     full_response += delta.content
                     print(delta.content, end="", flush=True)
             t5 = time.time()

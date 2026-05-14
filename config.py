@@ -65,8 +65,11 @@ GPU_OFFLOAD: Dict[str, str] = {
     "llm":       "max",   # Qwen 3.6 27B 推理模型
 }
 
-# 推理上下文长度 (输入+输出总窗口，16k 适配 27B 模型 RAG 场景)
-LLM_CONTEXT_LENGTH = 16384
+# LLM 推理过程开关 (LM Studio reasoning_effort，支持: none / minimal / low / medium / high / xhigh)
+REASONING_EFFORT = "high"
+
+# 推理上下文长度 (输入+输出总窗口)
+LLM_CONTEXT_LENGTH = 65536
 # 单次响应最大生成 token 数 (非流式输出，4096 平衡响应完整度与速度)
 MAX_OUTPUT_TOKENS = 4096
 # 嵌入模型上下文窗口
@@ -80,8 +83,8 @@ VLM_MAX_RETRIES = 2
 # ==========================================
 # 3. 文档切块配置 (为 27B 模型专门扩容)
 # ==========================================
-CHUNK_SIZE = 800       # 增大尺寸，保证规范段落完整
-CHUNK_OVERLAP = 150    # 增大重叠，防止关键数据被腰斩
+CHUNK_SIZE = 600       # 增大尺寸，保证规范段落完整
+CHUNK_OVERLAP = 120    # 增大重叠，防止关键数据被腰斩
 
 # Markdown 标题切分层级
 HEADERS_TO_SPLIT_ON = [
@@ -94,7 +97,7 @@ HEADERS_TO_SPLIT_ON = [
 # ==========================================
 # 4. RAG 检索配置
 # ==========================================
-RETRIEVAL_K = 5        # 增加召回数量，给 9B 提供更足的弹药
+RETRIEVAL_K = 10        # 增加召回数量，给 9B 提供更足的弹药
 
 # ==========================================
 # 5. 元数据提取配置
