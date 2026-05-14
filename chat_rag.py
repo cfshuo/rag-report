@@ -9,6 +9,7 @@ chat_rag.py — 海洋工程 RAG 对话系统 (终端纯净输出版)
 import logging
 import readline  # noqa: F401 — 强制激活终端行编辑（退格/方向键/历史）
 import re
+import time
 import warnings
 from typing import Set
 
@@ -58,11 +59,20 @@ def _hybrid_retrieval(db, query: str, top_k: int):
     if not clause_nums:
         return db.similarity_search(query, k=top_k)
 
-    # 条款编号定向向量检索 — 构造针对性的查询语句，走 HNSW 索引 O(log N)
+    # 条款编号定向向量检索 — 将编号与原始查询语义融合，走 HNSW 索引 O(log N)
     seen: set[str] = set()
     clause_hits: list = []
+    # 去除条款编号、标准代号等泛化词，提取纯语义关键词做定向检索
+    semantic_query = re.sub(r'第\s*\d+(?:\.\d+)*\s*[条章节款]', '', query).strip()
+    semantic_query = re.sub(r'[条款章节]\s*\d+(?:\.\d+)*', '', semantic_query).strip()
+    # 去掉标准编号 (如 NB/T31029-2019)，这类词会干扰条款级语义检索
+    semantic_query = re.sub(r'[A-Z]{2,}/[A-Z]\s*\d+[-–—]\d+', '', semantic_query).strip()
+    if not semantic_query:
+        semantic_query = query
     for num in clause_nums:
-        for doc in db.similarity_search(f"第{num}条 条款{num}", k=3):
+        # 用条款号 + 语义查询融合，避免纯数字匹配失效
+        clause_query = f"{num} {semantic_query}"
+        for doc in db.similarity_search(clause_query, k=3):
             if doc.page_content not in seen:
                 clause_hits.append(doc)
                 seen.add(doc.page_content)
@@ -224,8 +234,7 @@ def _clean_model_output(text: str) -> str:
 def _build_system_prompt(context_text: str) -> str:
     """
     构建系统提示词。
-    解除对模型输出格式的死板限制，让 9B 模型发挥最自然的语言能力，
-    后续的终端纯净化交由 Python 的 _clean_model_output 函数处理。
+    输出铁律：三段式结构（引言 → 核心解答 → 专家补充），参考文献由系统自动追加。
     """
     # 预处理：清洗参考资料中的 LaTeX/Markdown 格式，防止输入端污染
     clean_context = _clean_model_output(context_text)
@@ -239,10 +248,38 @@ def _build_system_prompt(context_text: str) -> str:
     return (
         "你是一位专业的海洋水文气象高级工程师。\n"
         "请严谨地基于提供的【参考资料】来回答用户的问题。\n\n"
-        "【回答纪律】：\n"
-        "1. 请逻辑清晰、分点作答。如果涉及数学关系，尽量使用通俗易懂的文本描述。\n"
-        "2. 如果资料中没有相关信息，请直接回答：“根据提供的资料，无法回答该问题。”，绝对不要编造数据或凭空猜测。\n"
-        "3. 禁止使用任何 Markdown 格式（不要使用 **、*、#、```、___ 等符号），输出纯文本即可。\n\n"
+        "【输出格式要求 — 必须严格遵循以下三段式结构，违反即为不合格】：\n\n"
+        "=== 第一段：引言与背景 ===\n"
+        "用一句话平滑引入，必须包含「根据《XXX规范》第X条...」或「依据XXX资料...」，并简述问题背景。\n"
+        "这段让读者知道答案来自哪里、讨论的是什么话题。\n\n"
+        "=== 第二段：核心解答 ===\n"
+        "根据问题类型，分两种情形处理：\n"
+        "  - 多维度/复杂条目：使用「1、2、3」（阿拉伯数字）逐条列出，每条带清晰小标题。\n"
+        "    示例：「1. 远海风电场：场区离海缆路由登陆点所在岸线最近距离大于65km的风电场。」\n"
+        "  - 单一事实问题（查数值、查定义）：用一段话直接给出精准答案，严禁强行分条。\n"
+        "    对单一事实使用「第一」「第二」「第三」「第四」属于严重违规的凑字数行为。\n\n"
+        "=== 第三段：专家补充 / 发散思考 ===\n"
+        "以「注：」或「补充说明：」开头，基于当前问题给出有价值的专业关联信息，例如：\n"
+        "  - 相关概念的对照对比（问深海，可补充浅海的界限作为对照；问远海，可补充近海的定义）\n"
+        "  - 实际工程中的注意事项\n"
+        "  - 与问题相关的上下游知识\n"
+        "此段展现你的专家视野，但须与问题密切相关，不得离题。\n\n"
+        "---\n"
+        "【正确示例 — 问「深远海的划分」】\n"
+        "根据《海上风电场工程风能资源测量及海洋水文观测规范》（NB/T31029-2019），海上风电场根据离岸距离或场址水深大小进行划分，关于远海与深海的划分标准如下：\n"
+        "1. 远海风电场：场区离海缆路由登陆点所在岸线最近距离大于65km的风电场。\n"
+        "2. 深海风电场：场区水深大于理论最低潮位以下50m的风电场。\n"
+        "注：规范中同时明确了近海风电场（离岸距离大于10km且不大于65km）与浅海风电场（水深在理论最低潮位以下0m~50m）的界限，作为深远海划分的对照依据。\n\n"
+        "【错误示例 — 问「流速V≥100cm/s时流向准确度是多少」（单一事实）】\n"
+        "「第一，依据规范... 第二，表格显示... 第三，当流速V≥100cm/s时，流向准确度为±5°。第四，因此准确度是±5°。」\n"
+        "以上错误原因：对单一事实强行分条，第三点和第四点重复相同答案，充满废话。\n"
+        "正确做法：引言一句话带出规范来源，第二段一句话给出答案，第三段补充说明，干净利落。\n\n"
+        "【补充铁律】\n"
+        "1. 输出纯文本，不要使用 Markdown 格式（不要用 **、*、#、``` 等符号）。\n"
+        "2. 禁止描述参考资料的结构（如「该表格详细列出了...」是废话）。\n"
+        "3. 禁止在结尾重复总结（如「因此，针对您询问的...」「综上所述...」）。答案只说一遍。\n"
+        "4. 如果资料中没有相关信息，请直接回答：「根据提供的资料，无法回答该问题。」，绝对不要编造数据。\n"
+        "5. 禁止在末尾单独输出参考文献名称或编号。参考文献由系统自动追加，你不需要画蛇添足。\n\n"
         f"以下是相关参考资料：\n{clean_context}"
     )
 
@@ -288,7 +325,9 @@ def chat_loop() -> None:
             continue
 
         print("🔍 正在检索相关水文报告与规范片段...")
+        t0 = time.time()
         docs = _hybrid_retrieval(db, user_query, config.RETRIEVAL_K)
+        t1 = time.time()
 
         if not docs:
             _log.info("未检索到相关知识: %s", user_query[:80])
@@ -296,7 +335,9 @@ def chat_loop() -> None:
             continue
 
         context_text, source_files = _build_context(docs)
+        t2 = time.time()
         system_prompt = _build_system_prompt(context_text)
+        t3 = time.time()
 
         # 构建仅包含当前问题和系统提示的消息列表
         messages: list[dict] = [
@@ -307,28 +348,35 @@ def chat_loop() -> None:
         print("🤖 专家回答: \n", end="", flush=True)
 
         try:
-            resp = _client.chat.completions.create(
+            t4 = time.time()
+            stream = _client.chat.completions.create(
                 model=config.LLM_MODEL_NAME,
                 messages=messages,
                 temperature=0.1,
                 max_tokens=config.MAX_OUTPUT_TOKENS,
-                stream=False,
+                stream=True,
                 timeout=120.0,
             )
 
-            full_response = resp.choices[0].message.content or ""
+            full_response = ""
+            for chunk in stream:
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    full_response += delta.content
+                    print(delta.content, end="", flush=True)
+            t5 = time.time()
 
             if not full_response.strip():
                 _log.warning("模型返回空内容 — query=%.80s", user_query)
                 print("[系统提示：模型未返回有效内容]")
             else:
-                # 终端纯净输出：去除可能的 markdown 残留后直接打印
-                clean_text = _clean_model_output(full_response)
-                print(clean_text)
-                print("\n📑 [参考来源]:")
+                print("\n\n📑 [参考来源]:")
                 for s in sorted(source_files):
                     print(f"- {s}")
 
+                # 耗时打点（仅日志，不在终端输出）
+                _log.info("耗时: 总%.1fs 检索%.1fs LLM推理%.1fs 提示词%d字",
+                          t5 - t0, t1 - t0, t5 - t4, len(system_prompt) + len(user_query))
         except Exception as e:
             _log.error("模型生成异常: %s", e)
             print(f"\n模型生成异常: {e}")
